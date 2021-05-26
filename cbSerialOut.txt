@@ -1,0 +1,31 @@
+The following is a sample of the data that is sent from the Receiver end
+of the Coffin Butte Repeater Monitor.  It is sent via USB-Serial to a
+serial terminal.  The update period is once per mnute, set by the Transmit
+site.
+
+
+Coffin Butte 147.42 MHz Simplex Repeater Report  Rev 0.1
+Data as Received: 
+ 0768,0000,0032,0000,1198,1256,0400,0001,1488,0573,0737,0433,2032,1010,0006,0000,00000
+ +12 Supply Voltage: 11.9
+ +5 Internal Voltage: 5.1
+ RSSI: -88
+ SNR dB: 31
+ Decode failures = 0
+ Frequency Fr-Ft difference, kHz: 0.09
+ Current Receiver Tuning, MHz: 923.297
+ Report from Repeater Site:
+   Time in minutes:  0000 0032
+   Solar Panel Voltage = 0.00
+   Battery Current Amps = 0.077
+   Supply Voltage from Battery = 13.79
+   5V Supply Voltage for Teensy = 5.082
+   LoRa measured RF Power = 15.4 dBm
+   2-meter RF Power = 0.78 Watts
+   External Temperature, Celsius = 19.8
+   Internal Temperature, Celsius = 25.6
+   Internal Humidity, percent = 40.00
+   Atmospheric Pressure in-Hg = 30.58
+   Version of Transmit INO: 0X68
+   Status of Transmit end: 0X7
+   Restart Count = 12
