@@ -2,8 +2,10 @@
  * Repeater monitor for Coffin Butte 147.42 Simplex Repeater
  * WARNING - do NOT use "Smallest Code" option under tools (sprintf issues)
  * W7PUA 10 Jan 2021; Rev 0.2 22 May 2021
+ * W7PUA Rev 0.3 added alternate LCD screen, corrected gain and offset 
+ *   of A9 battery current, improved LCD screens 6 June 2021
  */
-
+ 
 #include <SPI.h>
 #include <RH_RF95.h>
 #include <Wire.h>
@@ -11,6 +13,7 @@
 #include <DallasTemperature.h>
 #include <SD.h>
 #include <SerialFlash.h>
+#include <Bounce.h>
 
 /* We need minimum LCD functions, so build minimum library. Pieces taken
  * from LCD_I2C_Teensy36 that also has I2C  parts that collide with Wire.h.
@@ -74,6 +77,16 @@ char    lcdData[2][17]; // Allow for possible \0's (not needed)
 
 uint8_t buf[RH_RF95_MAX_MESSAGE_LEN];  // 251
 uint8_t len = sizeof(buf);
+
+// Fake data speeds up debug by not needing to wait for real data from CButte
+uint16_t fakeData[17] = {768,12,3456,0,1145,1209,411,2704,1490,572,1485,545,2045,988,11,0,0};
+#define USING_FAKE_DATA 0
+#if USING_FAKE_DATA == 1
+bool usingFake = true;
+#else
+bool usingFake = false;
+#endif
+
 int led = 17;
 float sc5V, sc12V;    // Local receive end measurementscbStatus
 
@@ -88,8 +101,9 @@ uint8_t scError = 0;  // ditto
 uint32_t t0 = 0;
 int16_t analogIn[10];
 int8_t  analogPin[] = {A0, A1, A2, -1, -1, -1, -1, A7, A8, A9}; // -1 for non-analog pins
-float   analogMultiplier[10] = {0.0102286f, 0.00926826f, 0.0088689f, 0.0f, 0.0f, 0.0f, 0.0f, 0.001f, 0.0008815f, 0.01546f};
-int16_t analogOffset[10] =     {         1,          0,          0,    0,    0,    0,    0,      1,      1,     2027};     
+// Correction for 7 June 21  A9 battery current was offset 2027.  Changed to 2054 and reverse sign of gain
+float   analogMultiplier[10] = {0.0102286f, 0.00926826f, 0.0088689f, 0.0f, 0.0f, 0.0f, 0.0f, 0.001f, 0.0008815f, -0.01546f};
+int16_t analogOffset[10] =     {         1,          0,          0,    0,    0,    0,    0,      1,      1,     2054};     
 char    analogShortName[10][5] = { "Solr",    "+12V",      "5.0V", "   ", "    ", "    ", "  ", "PLor", "P2m ", "IBat"};
 
 /* 86 char in LoRa send line c[]
@@ -124,8 +138,30 @@ uint32_t minutesTime;
 float frequencyRMHz = FREQUENCY_BASE;
 float frequencyErrorMHz = 0.0f;
 bool outOfLock = false;
+bool backlightOn = true;
 
-uint8_t charOK[] = {0X1C, 0X14, 0X14, 0X1C, 0X05, 0X06, 0X05, 0X05};
+//  Allow for multiple LCD display options, 0 and 1 now
+uint8_t selectLCD = 0;
+// Push buttons
+Bounce pushButtonTop =    Bounce(3, 10);  // 10 ms debounce
+Bounce pushButtonBottom = Bounce(4, 10);
+
+#define CH_BLANK 0
+#define CH_OK 1
+#define CH_RSSI 2
+#define CH_IB 3
+#define CH_VS 4
+#define CH_TE 5
+#define CH_TI 6
+#define CH_P2 7
+uint8_t charBlank[] = {0, 0, 0, 0, 0, 0, 0, 0};
+uint8_t charOK[] =   {0X1C, 0X14, 0X14, 0X1C, 0X05, 0X06, 0X05, 0X05}; 
+uint8_t charRSSI[] = {0X01, 0X01, 0X03, 0X03, 0X07, 0X07, 0X0F, 0X1F};
+uint8_t charIb[] =   {0X1C, 0X08, 0X08, 0X1C, 0X04, 0X07, 0X05, 0X07};
+uint8_t charVS[] =   {0X14, 0X14, 0X08, 0X07, 0X08, 0X06, 0X01, 0X0E};
+uint8_t charTe[] =   {0X1C, 0X08, 0X08, 0X0F, 0X04, 0X07, 0X04, 0X07};
+uint8_t charTi[] =   {0X1C, 0X08, 0X08, 0X0A, 0X00, 0X02, 0X02, 0X02};
+uint8_t charP2[] =   {0X1C, 0X14, 0X1C, 0X12, 0X15, 0X02, 0X04, 0X07};
 
 //  ****************   SETUP()   *******************
 void setup()  {
@@ -137,9 +173,9 @@ void setup()  {
   Serial.println(" RH_RF95 Lora Receiver ver 0.2");
 
   for(int i=0; i<86; i++) {
-    c[i]=(char)'-';
+    c[i]=(char)'-';           // Data down from transmit end
     for(int j=0; j<16; j++)
-       cSave[j][i] = ' ';
+       cSave[j][i] = ' ';     // Save for history dump
     }
   c[85] = 0;
 
@@ -156,6 +192,10 @@ void setup()  {
   pinMode (6, HIGH);
   SPI1.begin();           // initialize SPI:
 #endif
+
+
+  pinMode(3, INPUT_PULLUP);  // Push Buttons
+  pinMode(4, INPUT_PULLUP);
 
   decodeFails=0;
   loraReset();  // Reset pin low and then high
@@ -180,7 +220,14 @@ void setup()  {
   lcdClear_cb();
   delay(4000);
 
-  lcdCreateChar_cb(0, charOK);  // Custom character, small 'o' and small 'k'
+  lcdCreateChar_cb(CH_BLANK, charBlank);  // Custom character, blank for ASCII 0X00
+  lcdCreateChar_cb(CH_OK,    charOK);     // Custom character, small 'o' and small 'k'
+  lcdCreateChar_cb(CH_RSSI,  charRSSI);   // s-meter symbol
+  lcdCreateChar_cb(CH_IB,    charIb);
+  lcdCreateChar_cb(CH_VS,    charVS);
+  lcdCreateChar_cb(CH_TE,    charTe);
+  lcdCreateChar_cb(CH_TI,    charTi);
+  lcdCreateChar_cb(CH_P2,    charP2);
   strcpy( &lcdData[0][0], "1               " );
   strcpy( &lcdData[1][0], "2               " );
   lcdPrintLine(0);
@@ -190,18 +237,119 @@ void setup()  {
 //    *************   LOOP()   ***********
 void loop()  {
    // This puts a slight flicker to the LED when the loop is running
-   LED_OFF;
-   delay(10);
-   LED_ON;
-   delay(200);
-   if ( rf95.available() )  {
+   if(backlightOn == true)  {
+      LED_OFF;
+      delay(10);
+      LED_ON;
+      delay(200);
+      }
+    else  {  // Dim to 1/3 power
+      LED_OFF;
+      delay(15);
+      LED_ON;
+      delay(5);
+      }
+
+   if (pushButtonTop.update()) {
+       if (pushButtonTop.fallingEdge()) {
+          selectLCD++;
+          if(selectLCD==2) selectLCD=0;
+          displayResults();
+          }
+      }
+
+   if (pushButtonBottom.update()) {
+       if (pushButtonBottom.fallingEdge()) {
+          if(backlightOn == true) {
+             backlightOn = false;
+             noBacklight_cb();
+             }
+          else  {
+             backlightOn = true;
+             backlight_cb();
+             }
+          }
+      }
+
+   if ( rf95.available() || usingFake )  {
       // Should be a message for us now
-      if (rf95.recv(buf, &len))  {
-         Serial.println("\n\nCoffin Butte 147.42 MHz Simplex Repeater Report  Rev 0.1");
-         // RH_RF95::printBuffer("Receive occurred, data = ", buf, len);
+      if (rf95.recv(buf, &len) || usingFake)  {
+         Serial.println("\n\nCoffin Butte 147.42 MHz Simplex Repeater Report  Rev 0.2");
+         if(usingFake) {
+           for(int ii=0; ii<16; ii++)
+              sprintf(&buf[5*ii], "%.4u,", fakeData[ii]);
+           sprintf(&buf[80], "%.4u", fakeData[16]);
+           delay(2000);
+         }
          Serial.println("Data as Received: ");
          Serial.println((char*)buf);
+         Serial.print("Decode failures = ");
+         Serial.println(decodeFails);
+         frequencyErrorMHz = 0.001f*FrequencyErrorKHz();
+         Serial.print("Frequency Fr-Ft difference, kHz: ");
+         Serial.println(1000.0f*frequencyErrorMHz, 2);
+         frequencyAFC(frequencyErrorMHz);
+         }
+      else  {
+         decodeFails++;
+         Serial.print("Receive available, but Defodefailure.");
+         Serial.print("  Cumulative Decode failures = ");
+         Serial.println(decodeFails);
+         }
+         
+      displayResults();
 
+      // Every 3 hours, save a sample of the data in a 16 entry circular buffer.
+      if(minutesTime - timeSave >= 180) {  // Every 3 hours
+          int j = ++indexSave & 0X0F;
+          for(int ii=0; ii<86; ii++)
+              cSave[j][ii] = c[ii];
+          indexSave = j;
+          timeSave = minutesTime;
+          }
+      }      // End, if LoRa data available
+   }   // End loop()
+
+  // Display results to both Serial Monitor and LCD
+  void displayResults(void)  {
+     if(selectLCD == 0) {  // Normal Display on LCD
+        Serial.print("+12 Supply Voltage: ");
+        sc12V = 0.035353f*(float)analogRead(A1);
+        Serial.println(sc12V, 1);
+        if(sc12V<11.0f || sc12V>16.0f)  scError |= 1;
+
+        Serial.print("+5 Internal Voltage: ");
+        sc5V = 0.035353f*(float)analogRead(A2);
+        Serial.println(sc5V, 1);
+        if(sc5V<4.5f || sc5V>5.5f)  scError |= 1;
+
+        Serial.print("RSSI: ");
+        Serial.println(rf95.lastRssi(), DEC);  // int16_t
+        
+        scSNR(DISPLAY_SERIAL, 0, 0);
+
+        // Set errors to zero and then check
+        cbError = 0;
+        scError = 0;
+        lcdClear_cb();
+        // Now process the line of numbers
+        Serial.println("Report from Repeater Site:");
+        scRSSI(DISPLAY_SERIAL | DISPLAY_LCD, 0, 0);
+        scTimeDate(DISPLAY_SERIAL | DISPLAY_LCD, 1, 11, 2);
+        scVoltsSolar(DISPLAY_SERIAL | DISPLAY_LCD, 1, 0);
+        scCurrentBattery(DISPLAY_SERIAL | DISPLAY_LCD, 1, 4);
+        scVolts12(DISPLAY_SERIAL, 1, 0);
+        scVolts5(DISPLAY_SERIAL, 1, 0); 
+        scVoltsRFLoRa(DISPLAY_SERIAL, 0, 0);
+        scVoltsRF2mtr(DISPLAY_SERIAL, 0, 0);
+        scExtTemp(DISPLAY_SERIAL | DISPLAY_LCD, 0, 6);
+        scInternalTemp(DISPLAY_SERIAL, 0, 6);
+        scInternalHumidity(DISPLAY_SERIAL | DISPLAY_LCD, 0, 11);
+        scAtmosPress(DISPLAY_SERIAL, 0, 0);
+        statusVersion(DISPLAY_SERIAL, 0, 15);
+        scRestartCount(DISPLAY_SERIAL, 0, 0);
+     }
+     else  {  // selectLCD==1, Alternate LCD screen
         Serial.print("+12 Supply Voltage: ");
         // This may be wrong K for some boards?
         sc12V = 0.035353f*(float)analogRead(A1);
@@ -214,59 +362,36 @@ void loop()  {
         if(sc5V<4.5f || sc5V>5.5f)  scError |= 1;
 
         Serial.print("RSSI: ");
-        Serial.println(rf95.lastRssi(), DEC);
-
-        scSNR(DISPLAY_SERIAL | DISPLAY_LCD, 0, 0);
-
-         Serial.print("Decode failures = ");
-         Serial.println(decodeFails);
-         // rf95.printRegisters();
-         frequencyErrorMHz = 0.001f*FrequencyErrorKHz();
-         Serial.print("Frequency Fr-Ft difference, kHz: ");
-         Serial.println(1000.0f*frequencyErrorMHz, 2);
-         frequencyAFC(frequencyErrorMHz);
-         }
-      else  {
-         decodeFails++;
-         Serial.print("Receive available, but Defodefailure.");
-         Serial.print("  Cumulative Decode failures = ");
-         Serial.println(decodeFails);
-         }
-
-      // Set errors to zero and then check
-      cbError = 0;
-      scError = 0;
-      lcdClear_cb();
-      // Now process the line of numbers
-      Serial.println("Report from Repeater Site:");
-      timeDate(DISPLAY_SERIAL, 0, 0);
-      scVoltsSolar(DISPLAY_SERIAL | DISPLAY_LCD, 1, 0);
-      scCurrentBattery(DISPLAY_SERIAL | DISPLAY_LCD, 1, 6);
-      scVolts12(DISPLAY_SERIAL, 1, 0);
-      scVolts5(DISPLAY_SERIAL, 1, 0); 
-      scVoltsRFLoRa(DISPLAY_SERIAL, 0, 0);
-      scVoltsRF2mtr(DISPLAY_SERIAL, 0, 0);
-      scExtTemp(DISPLAY_SERIAL, 0, 0);             // LCD Upper Left
-      scInternalTemp(DISPLAY_SERIAL | DISPLAY_LCD, 0, 5);
-      scInternalHumidity(DISPLAY_SERIAL | DISPLAY_LCD, 0, 11);
-      scAtmosPress(DISPLAY_SERIAL, 0, 0);
-      statusVersion(DISPLAY_SERIAL, 0, 15);
-      scRestartCount(DISPLAY_SERIAL, 0, 0);
-      setErrorCharacters();
-
-      lcdPrintLine(0);     // Update the 2x16 display
-      lcdPrintLine(1);
-
-      // Every 3 hours, save a sample of the data in a 16 entry circular buffer.
-      if(minutesTime - timeSave >= 180) {  // Every 3 hours
-          int j = ++indexSave & 0X0F;
-          for(int ii=0; ii<86; ii++)
-              cSave[j][ii] = c[ii];
-          indexSave = j;
-          timeSave = minutesTime;
-          }
-      }      // End, if LoRa data available
-   }   // End loop()
+        Serial.println(rf95.lastRssi(), DEC);  // int16_t
+        scSNR(DISPLAY_SERIAL | DISPLAY_LCD, 0, 6);
+        // Set errors to zero and then check
+        cbError = 0;
+        scError = 0;
+        lcdClear_cb();
+        // Now process the line of numbers
+        Serial.println("Report from Repeater Site:");
+        scRSSI(DISPLAY_SERIAL | DISPLAY_LCD, 0, 0);
+        scTimeDate(DISPLAY_SERIAL | DISPLAY_LCD, 1, 11, 2);
+        scVoltsSolar(DISPLAY_SERIAL, 1, 0);
+        scCurrentBattery(DISPLAY_SERIAL, 1, 4);
+        scVolts12(DISPLAY_SERIAL, 1, 0);
+        scVolts5(DISPLAY_SERIAL, 1, 0); 
+        scVoltsRFLoRa(DISPLAY_SERIAL | DISPLAY_LCD, 1, 5);
+        scVoltsRF2mtr(DISPLAY_SERIAL | DISPLAY_LCD, 1, 0);
+        scExtTemp(DISPLAY_SERIAL, 0, 0);
+        scInternalTemp(DISPLAY_SERIAL | DISPLAY_LCD, 0, 11);
+        scInternalHumidity(DISPLAY_SERIAL, 0, 0);
+        scAtmosPress(DISPLAY_SERIAL, 0, 0);
+        statusVersion(DISPLAY_SERIAL, 0, 15);
+        scRestartCount(DISPLAY_SERIAL, 0, 0);     
+    }
+    setErrorCharacters();
+    lcdPrintLine(0);     // Update the 2x16 display
+    lcdPrintLine(1);
+    // Clear the buffers for the next LCD display
+    strcpy( &lcdData[0][0], "                " );
+    strcpy( &lcdData[1][0], "                " );
+  }
 
 /* Errors  Value    Transmit end           Receive End
  * bit 0    1     Voltages, currents   Voltages, Currents
@@ -299,11 +424,11 @@ Receiver Site, Lower Right Status Character, error conditions
 
 void setErrorCharacters(void)  {
   if(cbError == 0)
-     lcdData[0][15] = 0;
+     lcdData[0][15] = 1;
   else
      lcdData[0][15] = hexChar2ASCII(cbError);
   if(scError == 0)
-     lcdData[1][15] = 0;
+     lcdData[1][15] = 1;
   else
      lcdData[1][15] = hexChar2ASCII(scError);
 }
@@ -382,7 +507,8 @@ void statusVersion(int display, int ln, int pos)  {
 // This is saved every 24 hours to EEPROM, and so a reset
 // at the transmit end will produce a backward jump in minutes.
 // 2-digital words, (0, 9999) for a maximum 99,999,999 minutes.
-void timeDate(int display, int ln, int pos)  {
+// nch is the number of characters to display on the LCD, 1, 2, 3 or 4
+void scTimeDate(int display, int ln, int pos, uint8_t nch)  {
     char mins[10];
 
     // Get two 4-digit numbers to string.
@@ -399,10 +525,13 @@ void timeDate(int display, int ln, int pos)  {
        Serial.print("  Time in minutes:  ");
        Serial.println(mins);
        }
-    // LCD print 
+    // LCD print just 
     if(display & 2) {
-       sprintf(&lcdData[ln][pos], "%s", mins);
-       lcdData[ln][pos + 8] = ' ';   // Space separator
+       //sprintf(&lcdData[ln][pos], "%s", mins);
+       //lcdData[ln][pos + 8] = ' ';   // Space separator
+       lcdData[ln][pos] = 'M';
+       for (int ii=0; ii<nch; ii++)
+         lcdData[ln][pos+nch-ii] = buf[13-ii];
        }
    }
 
@@ -410,7 +539,7 @@ void timeDate(int display, int ln, int pos)  {
 // https://forum.pjrc.com/threads/55152-Teensy-LC-printf-float-options Post #11
 // Convert a floating point number to a string with a %<m>.<n>f format.
 // On the Teensy, if you optimize for space, a smaller library is used that
-// does not do have %f, %g, etc. formats.
+// does not have %f, %g, etc. formats.
 void float2String (float number, char *buffer, int fract)  {
     bool negative   = (number < 0.0f);
     float absNumberf   = fabsf (number);
@@ -499,10 +628,9 @@ void scVoltsSolar(int display, int ln, int pos)
        Serial.println(vi, 2);
        }
     if(display & 2) {
-       lcdData[ln][pos] = 'V';
-       lcdData[ln][pos+1] = 's';
-       float2String(vi, &lcdData[ln][pos+2],0);
-       lcdData[ln][pos + 4] = ' ';
+       lcdData[ln][pos] = CH_VS;
+       float2String(vi, &lcdData[ln][pos+1],0);
+       lcdData[ln][pos + 3] = ' ';
        }
     if(vi>40.0f)  cbError |= 1;
     }
@@ -517,9 +645,8 @@ void scVoltsRF2mtr(int display, int ln, int pos)
        Serial.println(" Watts");
        }
    if(display & 2) {
-       lcdData[ln][pos] = 'P';
-       lcdData[ln][pos+1] = '2';
-       float2String(vi, &lcdData[ln][pos+2],0);
+       float2String(power2M, &lcdData[ln][pos], 1);
+       lcdData[ln][pos] = CH_P2;
        lcdData[ln][pos + 4] = ' ';
        }
     if(power2M<0.5f || power2M>7.0f)  cbError |= 8;
@@ -536,12 +663,12 @@ void scVoltsRFLoRa(int display, int ln, int pos)
        Serial.println(" dBm");
        }
    if(display & 2) {
-       lcdData[ln][pos] = 'P';
-       lcdData[ln][pos+1] = 'L';
-       float2String(vi, &lcdData[ln][pos+2],0);
-       lcdData[ln][pos + 4] = ' ';
+
+       float2String(P, &lcdData[ln][pos+1],1);
+       lcdData[ln][pos] = 'L';
+       lcdData[ln][pos + 5] = ' ';
        }
-    if(P<10.0f)  cbError |= 2;
+    if(P<15.0f || P>19.0f)  cbError |= 2;
     }
 
 void scCurrentBattery(int display, int ln, int pos)
@@ -552,10 +679,16 @@ void scCurrentBattery(int display, int ln, int pos)
        Serial.println(vi, 3);
        }
     if(display & 2) {
-       lcdData[ln][pos] = 'I';
-       lcdData[ln][pos+1] = 'b';
-       float2String(vi, &lcdData[ln][pos+2], 2);
-       lcdData[ln][pos + 7] = ' ';
+       if(vi < 0.0f)  {    // Arrange next to Ib symbol
+          float2String(vi, &lcdData[ln][pos+1], 2);
+          lcdData[ln][pos + 6] = ' ';
+          }
+       else  {   // move left one position
+          float2String(vi, &lcdData[ln][pos], 2);
+          lcdData[ln][pos + 5] = ' ';
+          }
+       lcdData[ln][pos] = CH_IB;
+
        }
     if (vi<-1.0f || vi>20.0f)  cbError |= 1;
     }
@@ -569,8 +702,11 @@ void scExtTemp(int display, int ln, int pos)
       Serial.println(vi, 1);
       }
    if(display & 2) {
-     lcdData[ln][pos] = 'T';
-     sprintf(&lcdData[ln][pos+1], "%3d", ivi/10);
+     if(ivi<0)
+        sprintf(&lcdData[ln][pos+1], "%3d", ivi/10);
+     else
+        sprintf(&lcdData[ln][pos], "%3d", ivi/10);  // Prevent space ch
+     lcdData[ln][pos] = CH_TE;
      lcdData[ln][pos + 4] = ' ';
      }
   // Errors, what would they be?
@@ -578,19 +714,42 @@ void scExtTemp(int display, int ln, int pos)
 
 void scSNR(int display, int ln, int pos)
    {
-   uint8_t snr = rf95.spiRead(0X19);
+   int8_t snr = rf95.spiRead(RH_RF95_REG_19_PKT_SNR_VALUE);
+   float SNRf = 0.25*(float)snr;
+   snr = (uint8_t)SNRf;
    if(display & 1) {
       Serial.print("SNR dB: ");
-      Serial.println(snr);
+      Serial.println(SNRf, 1);
       }
-   if(display & 2) {
-      lcdData[ln][pos] =   'S';
-      lcdData[ln][pos+1] = 'N';
-      sprintf(&lcdData[ln][pos+2], "%2d", snr);
+   if(selectLCD == 1)
+     lcdData[ln][pos] =   'S';
+      sprintf(&lcdData[ln][pos+1], "%d", snr);
       lcdData[ln][pos + 4] = ' ';
-      }
-  if(snr<7)  scError |= 4;
+
+  if(SNRf<-15.0f) scError |= 4;
   }
+
+void scRSSI(int display, int ln, int pos)
+   {
+   int16_t rssi = rf95.lastRssi();
+
+   if(display & 1) {
+      Serial.print("RSSI dBm: ");
+      Serial.println(rssi);
+      }
+   if(display & 2)  {
+     lcdData[ln][pos] =  CH_RSSI;
+      sprintf(&lcdData[ln][pos+1], "%d", rssi);
+      if(rssi <= -100)
+         lcdData[ln][pos + 5] = ' ';
+      else
+         lcdData[ln][pos + 5] = ' ';
+      }
+   if(rssi<-115) scError |= 4;
+   }
+
+// Info: #define REG_PKT_RSSI_VALUE       0x1a
+//       #define REG_PKT_SNR_VALUE        0x1b 
 
 void scRestartCount(int display, int ln, int pos)
     {
@@ -603,7 +762,7 @@ void scRestartCount(int display, int ln, int pos)
        Serial.println(ct, 4);
        }
     if(display & 2) {
-       lcdData[ln][pos] = 'R';
+       lcdData[ln][pos] = 'C';
        sprintf(&lcdData[ln][pos+1], "%4d", ct);
        lcdData[ln][pos + 5] = ' ';
        }
@@ -619,10 +778,12 @@ void scInternalTemp(int display, int ln, int pos)
       Serial.println(vi, 1);
       }
    if(display & 2) {
-     lcdData[ln][pos] = 'T';
-     lcdData[ln][pos+1] = 'i';
-     sprintf(&lcdData[ln][pos+2], "%3d", ivi/10);
-     lcdData[ln][pos + 5] = ' ';
+     if(ivi<0)
+        sprintf(&lcdData[ln][pos+1], "%3d", ivi/10);
+     else
+        sprintf(&lcdData[ln][pos], "%3d", ivi/10);  // Prevent space ch
+     lcdData[ln][pos] = CH_TI;
+     lcdData[ln][pos + 4] = ' ';
      }
    if(vi>50.0f)  scError |= 4;
    }
